@@ -14,18 +14,33 @@ from pybnn.util.normalization import zero_mean_unit_var_normalization, zero_mean
 from pybnn.bayesian_linear_regression import BayesianLinearRegression, Prior
 
 
+def repulsion_force(Phi):
+    m_ = Phi.shape[1]
+    def kernel(a, b): return torch.exp(-torch.norm(a - b, dim=0, p=2))
+    ans = []
+    for i in range(m_):
+        for j in range(i, m_):
+            if i != j:
+                ans.append(kernel(Phi[:, i], Phi[:, j]).reshape(1))
+    # assert len(ans) == int(0.5 * self.m_ * (self.m_ + 1) - self.m_)
+    ans = torch.cat(ans, dim=0)
+    return ans.mean()
+
+
 class Net(nn.Module):
-    def __init__(self, n_inputs, n_units=[50, 50, 50]):
+    def __init__(self, n_inputs, n_units=[50, 50, 50, 50]):
         super(Net, self).__init__()
         self.fc1 = nn.Linear(n_inputs, n_units[0])
         self.fc2 = nn.Linear(n_units[0], n_units[1])
         self.fc3 = nn.Linear(n_units[1], n_units[2])
-        self.out = nn.Linear(n_units[2], 1)
+        self.fc4 = nn.Linear(n_units[2], n_units[3])
+        self.out = nn.Linear(n_units[3], 1)
 
     def forward(self, x):
         x = torch.tanh(self.fc1(x))
         x = torch.tanh(self.fc2(x))
         x = torch.tanh(self.fc3(x))
+        x = torch.tanh(self.fc4(x))
 
         return self.out(x)
 
@@ -33,6 +48,7 @@ class Net(nn.Module):
         x = torch.tanh(self.fc1(x))
         x = torch.tanh(self.fc2(x))
         x = torch.tanh(self.fc3(x))
+        x = torch.tanh(self.fc4(x))
         return x
 
 
@@ -40,7 +56,7 @@ class DNGO(BaseModel):
 
     def __init__(self, batch_size=10, num_epochs=500,
                  learning_rate=0.01,
-                 adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50,
+                 adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50, n_units_4=50,
                  alpha=1.0, beta=1000, prior=None, do_mcmc=True,
                  n_hypers=20, chain_length=2000, burnin_steps=2000,
                  normalize_input=True, normalize_output=True, rng=None):
@@ -125,6 +141,7 @@ class DNGO(BaseModel):
         self.n_units_1 = n_units_1
         self.n_units_2 = n_units_2
         self.n_units_3 = n_units_3
+        self.n_units_4 = n_units_4
         self.adapt_epoch = adapt_epoch
         self.network = None
         self.models = []
@@ -172,7 +189,7 @@ class DNGO(BaseModel):
         # Create the neural network
         features = X.shape[1]
 
-        self.network = Net(n_inputs=features, n_units=[self.n_units_1, self.n_units_2, self.n_units_3])
+        self.network = Net(n_inputs=features, n_units=[self.n_units_1, self.n_units_2, self.n_units_3, self.n_units_4])
 
         optimizer = optim.Adam(self.network.parameters(),
                                lr=self.init_learning_rate)
@@ -193,7 +210,7 @@ class DNGO(BaseModel):
 
                 optimizer.zero_grad()
                 output = self.network(inputs)
-                loss = torch.nn.functional.mse_loss(output, targets)
+                loss = torch.nn.functional.mse_loss(output, targets) + repulsion_force(self.network.basis_funcs(inputs))
                 loss.backward()
                 optimizer.step()
 
@@ -293,7 +310,7 @@ class DNGO(BaseModel):
         try:
             K_inv = np.linalg.inv(K)
         except np.linalg.linalg.LinAlgError:
-             K_inv = np.linalg.inv(K + np.random.rand(K.shape[0], K.shape[1]) * 1e-8)
+            K_inv = np.linalg.inv(K + np.random.rand(K.shape[0], K.shape[1]) * 1e-8)
 
         m = beta * np.dot(K_inv, self.Theta.T)
         m = np.dot(m, self.y)
