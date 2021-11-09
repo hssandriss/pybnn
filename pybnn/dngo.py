@@ -14,17 +14,30 @@ from pybnn.util.normalization import zero_mean_unit_var_normalization, zero_mean
 from pybnn.bayesian_linear_regression import BayesianLinearRegression, Prior
 
 
+import torch.nn.functional as F
+
+
+# def repulsion_force(Phi):
+#     m_ = Phi.shape[1]
+#     Phi_t = Phi.t()
+#     ans = torch.exp(-F.pdist(Phi_t, 2))
+#     assert ans.shape[0] == int(0.5 * m_ * (m_ + 1) - m_)
+#     return ans.mean()
+
+
 def repulsion_force(Phi):
-    m_ = Phi.shape[1]
-    def kernel(a, b): return torch.exp(-torch.norm(a - b, dim=0, p=2))
-    ans = []
-    for i in range(m_):
-        for j in range(i, m_):
-            if i != j:
-                ans.append(kernel(Phi[:, i], Phi[:, j]).reshape(1))
-    # assert len(ans) == int(0.5 * self.m_ * (self.m_ + 1) - self.m_)
-    ans = torch.cat(ans, dim=0)
-    return ans.mean()
+    # m_ = Phi.shape[1]
+    # def kernel(a, b): return torch.exp(-torch.norm(a - b, dim=0, p=2))
+    # ans = []
+    # for i in range(m_):
+    #     for j in range(i, m_):
+    #         if i != j:
+    #             ans.append(kernel(Phi[:, i], Phi[:, j]).reshape(1))
+    # # assert len(ans) == int(0.5 * self.m_ * (self.m_ + 1) - self.m_)
+    # ans = torch.cat(ans, dim=0)
+    ans_ = torch.exp(-F.pdist(Phi.t(), 2))
+    # import pdb; pdb.set_trace()
+    return ans_.mean()
 
 
 class Net(nn.Module):
@@ -55,7 +68,7 @@ class Net(nn.Module):
 class DNGO(BaseModel):
 
     def __init__(self, batch_size=10, num_epochs=500,
-                 learning_rate=0.01,
+                 learning_rate=5e-3,
                  adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50, n_units_4=50,
                  alpha=1.0, beta=1000, prior=None, do_mcmc=True,
                  n_hypers=20, chain_length=2000, burnin_steps=2000,
@@ -209,8 +222,9 @@ class DNGO(BaseModel):
                 targets = torch.Tensor(batch[1])
 
                 optimizer.zero_grad()
-                output = self.network(inputs)
-                loss = torch.nn.functional.mse_loss(output, targets) + repulsion_force(self.network.basis_funcs(inputs))
+                basis_fc = self.network.basis_funcs(inputs)
+                output = self.network.out(basis_fc)
+                loss = torch.nn.functional.mse_loss(output, targets) + 0.1 * repulsion_force(basis_fc)
                 loss.backward()
                 optimizer.step()
 
@@ -226,7 +240,7 @@ class DNGO(BaseModel):
             logging.debug("Training loss:\t\t{:.5g}".format(train_err / train_batches))
 
         # Design matrix
-        self.Theta = self.network.basis_funcs(torch.Tensor(self.X)).data.numpy()
+        self.Theta = self.network.basis_funcs(torch.Tensor(self.X)).data.numpy().astype(np.float64)
 
         if do_optimize:
             if self.do_mcmc:
@@ -240,7 +254,8 @@ class DNGO(BaseModel):
                     # Run MCMC sampling
                     result = self.sampler.run_mcmc(self.p0,
                                                    self.burnin_steps,
-                                                   rstate0=self.rng)
+                                                   rstate0=self.rng,
+                                                   progress=True)
                     self.p0 = result.coords
 
                     self.burned = True
@@ -248,7 +263,8 @@ class DNGO(BaseModel):
                 # Start sampling
                 pos = self.sampler.run_mcmc(self.p0,
                                             self.chain_length,
-                                            rstate0=self.rng)
+                                            rstate0=self.rng,
+                                            progress=True)
 
                 # Save the current position, it will be the startpoint in
                 # the next iteration
