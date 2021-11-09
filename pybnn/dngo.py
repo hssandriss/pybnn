@@ -67,8 +67,7 @@ class Net(nn.Module):
 
 class DNGO(BaseModel):
 
-    def __init__(self, batch_size=10, num_epochs=500,
-                 learning_rate=5e-3,
+    def __init__(self, batch_size=10, num_epochs=500, learning_rate=5e-4,
                  adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50, n_units_4=50,
                  alpha=1.0, beta=1000, prior=None, do_mcmc=True,
                  n_hypers=20, chain_length=2000, burnin_steps=2000,
@@ -222,9 +221,9 @@ class DNGO(BaseModel):
                 targets = torch.Tensor(batch[1])
 
                 optimizer.zero_grad()
-                basis_fc = self.network.basis_funcs(inputs)
-                output = self.network.out(basis_fc)
-                loss = torch.nn.functional.mse_loss(output, targets) + 0.1 * repulsion_force(basis_fc)
+                phi = self.network.basis_funcs(inputs)
+                output = self.network.out(phi)
+                loss = torch.nn.functional.mse_loss(output, targets) + 0.1 * repulsion_force(phi)
                 loss.backward()
                 optimizer.step()
 
