@@ -6,18 +6,18 @@ import os
 import pathlib
 from pybnn import DNGO
 from pybnn.util.normalization import zero_mean_unit_var_normalization, zero_mean_unit_var_denormalization
-
+import scipy
 import logging
 import sys
 
-root = logging.getLogger()
-root.setLevel(logging.DEBUG)
+# root = logging.getLogger()
+# root.setLevel(logging.DEBUG)
 
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-root.addHandler(handler)
+# handler = logging.StreamHandler(sys.stdout)
+# handler.setLevel(logging.DEBUG)
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# handler.setFormatter(formatter)
+# root.addHandler(handler)
 
 
 def my_data(x_min, x_max, n, train=True):
@@ -31,10 +31,8 @@ def my_data(x_min, x_max, n, train=True):
 def my_data_2_intervals(inter_1: tuple, inter_2: tuple, train=True):
     x_min, x_max, n0 = inter_1
     x_0 = np.linspace(x_min, x_max, n0)
-#     x_0 = np.expand_dims(x_0, -1)
     x_min, x_max, n1 = inter_2
     x_1 = np.linspace(x_min, x_max, n1)
-#     x_1 = np.expand_dims(x_1, -1)
     x = np.concatenate((x_0, x_1), 0)
     sigma = 3 * np.ones_like(x) if train else np.zeros_like(x)
     y = x**3 + np.random.normal(0, sigma)
@@ -52,7 +50,7 @@ plt.xlim(-7, 7)
 
 plt.show()
 
-model = DNGO(do_mcmc=True)
+model = DNGO(do_mcmc=True, batch_size=64, num_epochs=1000, learning_rate=1e-4)
 model.train(x[:, None], y, do_optimize=True)
 
 model_tag = f'model_cubic_toy_bll_{datetime.now().strftime("%d_%m_%Y-%H_%M")}'
@@ -66,22 +64,31 @@ basis_funcs = model.network.basis_funcs(torch.Tensor(x_test_norm)).data.numpy()
 for i in range(min(50, model.n_units_3)):
     plt.plot(grid, basis_funcs[:, i])
 plt.grid()
+plt.gca().set_xlim(-7, 7)
 plt.xlabel("Input")
 plt.ylabel("Basisfunction")
 plt.show()
 plt.savefig(os.path.join(model_dir, f"basis_functions.png"))
 
 
-y_pred = model.network(torch.Tensor(x_test_norm)).data.numpy()
+y_pred_st = model.network(torch.Tensor(x_test_norm)).data.numpy()
+y_pred = zero_mean_unit_var_denormalization(y_pred_st, model.y_mean, model.y_std)
+
 plt.plot(grid, y_pred)
 plt.scatter(x, y, s=1., c='#463c3c', zorder=0)
 plt.grid()
+plt.gca().set_ylim(-250, 250)
+plt.gca().set_xlim(-7, 7)
 plt.xlabel("Input")
 plt.ylabel("y_pred")
 plt.show()
 plt.savefig(os.path.join(model_dir, f"regression.png"))
-
 m, v = model.predict(grid[:, None])
+ll = scipy.stats.norm.logpdf(fvals, loc=m, scale=v)
+# np.mean(np.log(np.sqrt(2 * np.pi * v) * np.exp(-1 * (np.power(fvals - m, 2) / (2 * v)))))
+print(ll.mean())
+print(np.mean(np.log(np.sqrt(2 * np.pi * v) * np.exp(-1 * (np.power(fvals - m, 2) / (2 * v))))))
+
 
 plt.scatter(x, y, s=1., c='#463c3c', zorder=0, label="Train")
 plt.grid()

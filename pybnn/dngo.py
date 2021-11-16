@@ -1,21 +1,20 @@
-import time
 import logging
-import numpy as np
-import emcee
+import time
+from copy import deepcopy
 
+import emcee
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-
 from scipy import optimize
+from tqdm import tqdm
 
 from pybnn.base_model import BaseModel
-from pybnn.util.normalization import zero_mean_unit_var_normalization, zero_mean_unit_var_denormalization
 from pybnn.bayesian_linear_regression import BayesianLinearRegression, Prior
-
-
-import torch.nn.functional as F
-
+from pybnn.util.normalization import (zero_mean_unit_var_denormalization,
+                                      zero_mean_unit_var_normalization)
 
 # def repulsion_force(Phi):
 #     m_ = Phi.shape[1]
@@ -41,34 +40,38 @@ def repulsion_force(Phi):
 
 
 class Net(nn.Module):
-    def __init__(self, n_inputs, n_units=[50, 50, 50, 50]):
+    def __init__(self, n_inputs, n_units=[50, 50, 50], linear=False, bias=False):
         super(Net, self).__init__()
+        self.linear = linear
+        self.bias = bias
         self.fc1 = nn.Linear(n_inputs, n_units[0])
         self.fc2 = nn.Linear(n_units[0], n_units[1])
         self.fc3 = nn.Linear(n_units[1], n_units[2])
-        self.fc4 = nn.Linear(n_units[2], n_units[3])
-        self.out = nn.Linear(n_units[3], 1)
+        self.out = nn.Linear(n_units[2], 1)
 
     def forward(self, x):
         x = torch.tanh(self.fc1(x))
         x = torch.tanh(self.fc2(x))
         x = torch.tanh(self.fc3(x))
-        x = torch.tanh(self.fc4(x))
 
         return self.out(x)
 
     def basis_funcs(self, x):
+        raw_x = x
         x = torch.tanh(self.fc1(x))
         x = torch.tanh(self.fc2(x))
         x = torch.tanh(self.fc3(x))
-        x = torch.tanh(self.fc4(x))
+        if self.linear:
+            x = torch.cat((x, raw_x), dim=-1)
+        if self.bias:
+            x = torch.cat((x, torch.ones(size=(raw_x.shape[0], 1))), dim=-1)
         return x
 
 
 class DNGO(BaseModel):
 
-    def __init__(self, batch_size=10, num_epochs=500, learning_rate=5e-4,
-                 adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50, n_units_4=50,
+    def __init__(self, batch_size=10, num_epochs=500, learning_rate=1e-3,
+                 adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50,
                  alpha=1.0, beta=1000, prior=None, do_mcmc=True,
                  n_hypers=20, chain_length=2000, burnin_steps=2000,
                  normalize_input=True, normalize_output=True, rng=None):
@@ -98,6 +101,8 @@ class DNGO(BaseModel):
             Number of units in layer 2
         n_units_3: int
             Number of units in layer 3
+        n_units_4: int
+            Number of units in layer 4
         alpha: float
             Hyperparameter of the Bayesian linear regression
         beta: float
@@ -153,13 +158,13 @@ class DNGO(BaseModel):
         self.n_units_1 = n_units_1
         self.n_units_2 = n_units_2
         self.n_units_3 = n_units_3
-        self.n_units_4 = n_units_4
+
         self.adapt_epoch = adapt_epoch
         self.network = None
         self.models = []
         self.hypers = None
 
-    @BaseModel._check_shapes_train
+    @ BaseModel._check_shapes_train
     def train(self, X, y, do_optimize=True):
         """
         Trains the model on the provided data.
@@ -201,22 +206,22 @@ class DNGO(BaseModel):
         # Create the neural network
         features = X.shape[1]
 
-        self.network = Net(n_inputs=features, n_units=[self.n_units_1, self.n_units_2, self.n_units_3, self.n_units_4])
+        self.network = Net(n_inputs=features, n_units=[self.n_units_1, self.n_units_2, self.n_units_3])
 
         optimizer = optim.Adam(self.network.parameters(),
                                lr=self.init_learning_rate)
 
+        pbar = tqdm(range(self.num_epochs))
         # Start training
         lc = np.zeros([self.num_epochs])
-        for epoch in range(self.num_epochs):
+        for epoch in pbar:
 
             epoch_start_time = time.time()
 
             train_err = 0
             train_batches = 0
 
-            for batch in self.iterate_minibatches(self.X, self.y,
-                                                  batch_size, shuffle=True):
+            for batch in self.iterate_minibatches(self.X, self.y, batch_size, shuffle=True):
                 inputs = torch.Tensor(batch[0])
                 targets = torch.Tensor(batch[1])
 
@@ -237,14 +242,13 @@ class DNGO(BaseModel):
             total_time = curtime - start_time
             logging.debug("Epoch time {:.3f}s, total time {:.3f}s".format(epoch_time, total_time))
             logging.debug("Training loss:\t\t{:.5g}".format(train_err / train_batches))
-
+            pbar.set_description(desc=f"Epoch {epoch}, Trainng loss: {train_err / train_batches:.3f}")
         # Design matrix
         self.Theta = self.network.basis_funcs(torch.Tensor(self.X)).data.numpy().astype(np.float64)
 
         if do_optimize:
             if self.do_mcmc:
-                self.sampler = emcee.EnsembleSampler(self.n_hypers, 2,
-                                                     self.marginal_log_likelihood)
+                self.sampler = emcee.EnsembleSampler(self.n_hypers, 2, self.marginal_log_likelihood)
 
                 # Do a burn-in in the first iteration
                 if not self.burned:
@@ -325,6 +329,7 @@ class DNGO(BaseModel):
         try:
             K_inv = np.linalg.inv(K)
         except np.linalg.linalg.LinAlgError:
+            print("inversion didn't worked!")
             K_inv = np.linalg.inv(K + np.random.rand(K.shape[0], K.shape[1]) * 1e-8)
 
         m = beta * np.dot(K_inv, self.Theta.T)
@@ -335,7 +340,11 @@ class DNGO(BaseModel):
         mll -= N / 2 * np.log(2 * np.pi)
         mll -= beta / 2. * np.linalg.norm(self.y - np.dot(self.Theta, m), 2)
         mll -= alpha / 2. * np.dot(m.T, m)
-        mll -= 0.5 * np.log(np.linalg.det(K) + 1e-10)
+        # mll -= 0.5 * np.log(np.linalg.det(K) + 1e-8) # instable
+        sign, logdet = np.linalg.slogdet(K)
+        if sign <= 0:
+            import pdb; pdb.set_trace()
+        mll -= 0.5 * logdet
 
         if np.any(np.isnan(mll)):
             return -1e25
@@ -371,7 +380,7 @@ class DNGO(BaseModel):
                 excerpt = slice(start_idx, start_idx + batchsize)
             yield inputs[excerpt], targets[excerpt]
 
-    @BaseModel._check_shapes_predict
+    @ BaseModel._check_shapes_predict
     def predict(self, X_test):
         r"""
         Returns the predictive mean and variance of the objective function at
