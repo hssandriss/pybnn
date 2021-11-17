@@ -1,17 +1,13 @@
 import random
 
 import numpy as np
-import scipy
 import torch
 
 from pybnn import DNGO
-from pybnn.util.normalization import (inverse_z_score, whiten,
-                                      whitening_params, z_score,
-                                      z_score_params,
-                                      zero_mean_unit_var_denormalization,
-                                      zero_mean_unit_var_normalization)
+from pybnn.util.normalization import zero_mean_unit_var_normalization
 
 np.random.seed(1)
+
 ''' load dfalseata file '''
 data = np.loadtxt('data/boston_housing')
 
@@ -40,10 +36,5 @@ x_test_norm = zero_mean_unit_var_normalization(X_test, model.X_mean, model.X_std
 # Get basis functions from the network
 basis_funcs = model.network.basis_funcs(torch.Tensor(x_test_norm)).data.numpy()
 m, v = model.predict(X_test)
-ll = scipy.stats.norm.logpdf(y_test, loc=m, scale=v)
-print(ll.mean())
-print(np.mean(np.log(np.sqrt(2 * np.pi * v) * np.exp(-1 * (np.power(y_test - m, 2) / (2 * v))))))
+print(np.mean(np.log((1. / np.sqrt(2 * np.pi * v)) * np.exp(-1 * (np.power(y_test - m, 2) / (2 * v))))))
 import pdb; pdb.set_trace()
-
-
-# ll = loglikelihood(m, v, y_test)

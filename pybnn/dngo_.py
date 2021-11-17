@@ -13,8 +13,11 @@ from tqdm import tqdm
 
 from pybnn.base_model import BaseModel
 from pybnn.bayesian_linear_regression import BayesianLinearRegression, Prior
-from pybnn.util.normalization import (zero_mean_unit_var_denormalization,
+from pybnn.util.normalization import (whiten, whitening_params,
+                                      zero_mean_unit_var_denormalization,
                                       zero_mean_unit_var_normalization)
+
+# Same model as DNGO defined in dngo.py but with ZCA whitening of inputs
 
 
 def repulsion_force(Phi):
@@ -56,7 +59,7 @@ class DNGO(BaseModel):
     def __init__(self, batch_size=10, num_epochs=500, learning_rate=1e-3,
                  adapt_epoch=5000, n_units_1=50, n_units_2=50, n_units_3=50,
                  alpha=1.0, beta=1000, prior=None, do_mcmc=True,
-                 n_hypers=20, chain_length=10000, burnin_steps=2000,
+                 n_hypers=20, chain_length=2000, burnin_steps=2000,
                  normalize_input=True, normalize_output=True, rng=None):
         """
         Deep Networks for Global Optimization [1]. This module performs
@@ -168,7 +171,8 @@ class DNGO(BaseModel):
 
         # Normalize inputs
         if self.normalize_input:
-            self.X, self.X_mean, self.X_std = zero_mean_unit_var_normalization(X)
+            self.X_mean, self.X_std = whitening_params(X)
+            self.X = whiten(X, self.X_mean, self.X_std)
         else:
             self.X = X
 
@@ -384,7 +388,7 @@ class DNGO(BaseModel):
         """
         # Normalize inputs
         if self.normalize_input:
-            X_, _, _ = zero_mean_unit_var_normalization(X_test, self.X_mean, self.X_std)
+            X_ = whiten(X_test, self.X_mean, self.X_std)
         else:
             X_ = X_test
 
