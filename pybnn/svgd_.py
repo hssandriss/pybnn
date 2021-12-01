@@ -180,9 +180,11 @@ class svgd_bayesnn:
             for i in range(self.M):
                 w1, b1, w2, b2, loggamma, loglambda = self.unpack_weights(self.theta[i, :])
                 pred_y_dev = self.nn_predict(X_dev, w1, b1, w2, b2) * self.std_y_train + self.mean_y_train
+
                 # likelihood
-                def f_log_lik(loggamma): return np.sum(np.log(np.sqrt(np.exp(loggamma)) / np.sqrt(2 * np.pi)
-                                                              * np.exp(-1 * (np.power(pred_y_dev - y_dev, 2) / 2) * np.exp(loggamma))))
+                def f_log_lik(loggamma):
+                    return np.sum(np.log(np.sqrt(np.exp(loggamma)) / np.sqrt(2 * np.pi) * np.exp(-1 * (np.power(pred_y_dev - y_dev, 2) / 2) * np.exp(loggamma))))
+
                 # The higher probability is better
                 lik1 = f_log_lik(loggamma)
                 # one heuristic setting
