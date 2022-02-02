@@ -1,17 +1,15 @@
-import logging
 import time
 
-import emcee
 import numpy as np
+import scipy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from scipy import optimize
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from pybnn.base_model import BaseModel
-from pybnn.bayesian_linear_regression import BayesianLinearRegression, Prior
 from pybnn.util.normalization import (zero_mean_unit_var_denormalization,
                                       zero_mean_unit_var_normalization)
 
@@ -33,7 +31,9 @@ class TruePosterior:
     To avoid negative values of \gamma and \lambda, we update loggamma and loglambda instead."""
 
     def __init__(self, n, d, a0, b0) -> None:
-        self.n, self.d = n, d  # n is batch size and d is dimenstion of w
+        # n is total number of samples
+        # d is dimenstion of w (including bias)
+        self.n, self.d = n, d
         self.a0 = a0
         self.b0 = b0
 
@@ -47,16 +47,17 @@ class TruePosterior:
 
     def log_prior_w(self, loglambda, w):
         # Prior on w
-        return -0.5 * (self.d - 2) * (np.log(2 * np.pi) - loglambda) - (torch.exp(loglambda) / 2) * (torch.pow(w, 2).sum()) +\
+        return -0.5 * (self.d - 2) * (np.log(2 * np.pi) - loglambda) - (torch.exp(loglambda) / 2) * (w ** 2).sum() +\
             (self.a0 - 1) * loglambda - self.b0 * torch.exp(loglambda) + loglambda
 
     def log_posterior(self, phi, y, w, loglambda, loggamma):
         # Phi === [BasisFct | Linear | Bias]
+        # sub-sampling mini-batches of data, where (X, y) is the batch data, and N is the number of whole observations
         # Posterior on w
         return self.log_lik_data(y, phi @ w, loggamma) * (self.n / y.shape[0]) + self.log_prior_data(loggamma) + self.log_prior_w(loglambda, w)
 
-    def grad_log_posterior(self, phi: torch.Tensor, y: torch.Tensor, w: torch.Tensor, loglambda: torch.Tensor, loggamma: torch.Tensor):
-        """Computes the gradient of the log posterior 
+    def grad_log_posterior(self, phi, y, w, loglambda, loggamma):
+        """Computes the gradient of the log posterior
 
         Args:
             phi (torch.Tensor): Basis function
@@ -68,17 +69,21 @@ class TruePosterior:
         Returns:
             [type]: [description]
         """
+
+        loglambda, loggamma = torch.tensor(loglambda), torch.tensor(loggamma)
+        phi, y, w = torch.from_numpy(phi), torch.from_numpy(y), torch.from_numpy(w)
         w.requires_grad = True; loglambda.requires_grad = True; loggamma.requires_grad = True
         log_posterior = self.log_posterior(phi, y, w, loglambda, loggamma)
         dw, d_log_gamma, d_log_lambda = torch.autograd.grad(log_posterior, [w, loggamma, loglambda])
         w.requires_grad = False; loglambda.requires_grad = False; loggamma.requires_grad = False
-        return dw, d_log_gamma, d_log_lambda
+        return dw.data.cpu().numpy(), d_log_gamma.data.cpu().numpy(), d_log_lambda.data.cpu().numpy()
 
-    def sample(self):
-        w = 1.0 / np.sqrt(self.d + 1) * torch.randn(size=(self.d, 1))
-        loggamma = torch.distributions.Gamma(self.a0, self.b0).sample().log()
-        loglambda = torch.distributions.Gamma(self.a0, self.b0).sample().log()
-        return (w, loggamma, loglambda)
+    def init_weights(self):
+        w = 1.0 / np.sqrt(self.d + 1) * np.random.randn(self.d - 1)
+        b = 0.
+        loggamma = np.log(np.random.gamma(self.a0, self.b0))
+        loglambda = np.log(np.random.gamma(self.a0, self.b0))
+        return (np.concatenate((w, [b])), loggamma, loglambda)
 
 
 class Net(nn.Module):
@@ -109,8 +114,8 @@ class Net(nn.Module):
 
 
 class SVGD(BaseModel):
-
-    def __init__(self, X_train, y_train, batch_size=10, num_epochs=50, learning_rate=1e-3, svdg_iters=500, M=20, n_units_1=50, n_units_2=50, n_units_3=50, a0=1.0, b0=.1, linear=True, bias=True, normalize_input=True, normalize_output=True, rng=None, beta_1=0.9, beta_2=0.99, svgd_step=0.001):
+    @BaseModel._check_shapes_train
+    def __init__(self, X, y, batch_size=32, num_epochs=100, learning_rate=1e-3, svdg_iters=200, M=50, n_units_1=50, n_units_2=50, n_units_3=50, a0=1.0, b0=.1, linear=True, bias=True, normalize_input=True, normalize_output=True, rng=None, beta_1=0.9, beta_2=0.99, svgd_step=0.001):
         """
         Deep Networks for Global Optimization [1]. This module performs
         Bayesian Linear Regression with basis function extracted from a
@@ -155,21 +160,27 @@ class SVGD(BaseModel):
 
         self.normalize_input = normalize_input
         self.normalize_output = normalize_output
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
 
         # Normalize inputs
         if self.normalize_input:
-            self.X, self.X_mean, self.X_std = zero_mean_unit_var_normalization(X_train)
+            self.X_train, self.X_mean, self.X_std = zero_mean_unit_var_normalization(X_train)
+            self.X_val, _, _ = zero_mean_unit_var_normalization(X_val, self.X_mean, self.X_std)
         else:
-            self.X = X_train
+            self.X_train = X_train
+            self.X_val = X_val
 
         # Normalize ouputs
         if self.normalize_output:
-            self.y, self.y_mean, self.y_std = zero_mean_unit_var_normalization(y_train)
+            self.y_train, self.y_mean, self.y_std = zero_mean_unit_var_normalization(y_train)
+            self.y_val, _, _ = zero_mean_unit_var_normalization(y_val, self.y_mean, self.y_std)
         else:
-            self.y = y_train
-        self.y = self.y[:, None]
+            self.y_train = y_train
+            self.y_val = y_val
+        self.y_train = self.y_train[:, None]
+        self.y_val = self.y_val[:, None]
 
-        self.n, self.d = self.X.shape[0], self.X.shape[1]   # number of data, dimension
+        self.n, self.d = self.X_train.shape[0], self.X_train.shape[1]   # total number of data point in training data, dimension of input data
 
         # Number of particles
         self.M = M
@@ -205,10 +216,9 @@ class SVGD(BaseModel):
         self.b0 = b0
         self.posterior = TruePosterior(self.n, self.dim_w, self.a0, self.b0)
         # Particle initialization
-        self.theta = torch.zeros([self.M, self.dim_vars])
+        self.theta = np.zeros([self.M, self.dim_vars])
 
-    @BaseModel._check_shapes_train
-    def train(self, X_train, y_train, X_val=None, y_val=None):
+    def train(self):
         """
         Trains the model on the provided data.
 
@@ -227,15 +237,12 @@ class SVGD(BaseModel):
         start_time = time.time()
 
         # Check if we have enough points to create a minibatch otherwise use all data points
-        if self.X.shape[0] <= self.batch_size:
-            batch_size = self.X.shape[0]
+        if self.X_train.shape[0] <= self.batch_size:
+            batch_size = self.X_train.shape[0]
         else:
             batch_size = self.batch_size
 
-        # Create the neural network
-        features = X_train.shape[1]
-
-        self.network = Net(n_inputs=features, n_units=[self.n_units_1, self.n_units_2, self.n_units_3])
+        self.network = Net(n_inputs=self.d, n_units=[self.n_units_1, self.n_units_2, self.n_units_3])
 
         optimizer = optim.Adam(self.network.parameters(),
                                lr=self.init_learning_rate)
@@ -250,7 +257,7 @@ class SVGD(BaseModel):
             train_err = 0
             train_batches = 0
 
-            for batch in self.iterate_minibatches(self.X, self.y, batch_size, shuffle=True):
+            for batch in self.iterate_minibatches(self.X_train, self.y_train, batch_size, shuffle=False):
                 inputs = torch.Tensor(batch[0])
                 targets = torch.Tensor(batch[1])
 
@@ -271,27 +278,28 @@ class SVGD(BaseModel):
             pbar.set_description(desc=f"Epoch {epoch+1}/{self.num_epochs} , Trainng loss: {train_err / train_batches:.3f}")
 
         # Design matrix
-        self.Phi = self.network.basis_funcs(torch.Tensor(self.X), bias=self.bias, linear=self.linear).data
+        self.Phi = self.network.basis_funcs(torch.Tensor(self.X_train), bias=self.bias, linear=self.linear).data.cpu().numpy().astype(np.float64)
+
         # The basis function is now trained and in the next steps we define SVGD iterrations
         for i in range(self.M):
-            w, loggamma, loglambda = self.posterior.sample()
+            w, loggamma, loglambda = self.posterior.init_weights()
             # use better initialization for gamma
             ridx = np.random.choice(range(self.Phi.shape[0]), np.min([self.Phi.shape[0], 1000]), replace=False)
             y_hat = self.Phi[ridx] @ w
-            loggamma = -torch.log(torch.mean(np.power(y_hat - torch.from_numpy(y_train[ridx]), 2)))
+            loggamma = -np.log(np.mean(np.power(y_hat - self.y_train[ridx], 2)))
             self.theta[i, :] = self.pack_weights(w, loggamma, loglambda)
 
-        grad_theta = torch.zeros(size=(self.M, self.dim_vars))  # gradient
+        grad_theta = np.zeros([self.M, self.dim_vars])  # gradient
         # adagrad with momentum
         eps = 1e-6
-        v = 0
-        m = 0
-        pbar = tqdm(range(self.max_iter), ncols=150)
+        v, m = 0, 0
+
+        pbar = tqdm(range(self.max_iter))
         for iter in pbar:
             # sub-sampling
-            for batch in self.iterate_minibatches(self.Phi, self.y, batch_size, shuffle=True):
-                phi = torch.Tensor(batch[0])
-                targets = torch.Tensor(batch[1])
+            for batch in self.iterate_minibatches(self.Phi, self.y_train, batch_size, shuffle=False):
+                phi = batch[0]
+                targets = batch[1]
                 for i in range(self.M):
                     w, loggamma, loglambda = self.unpack_weights(self.theta[i, :])
                     dw, dloggamma, dloglambda = self.posterior.grad_log_posterior(phi, targets, w, loglambda, loggamma)
@@ -299,71 +307,70 @@ class SVGD(BaseModel):
 
                 # calculating the kernel matrix
                 kxy, dxkxy = self.svgd_kernel(h=-1)
-                grad_theta = (torch.matmul(kxy, grad_theta) + dxkxy) / self.M   # \Phi(x)
+                grad_theta = (np.matmul(kxy, grad_theta) + dxkxy) / self.M   # \Phi(x)
 
                 # adagrad
                 if iter == 0:
                     m = m + grad_theta
-                    v = v + torch.multiply(grad_theta, grad_theta)
+                    v = v + np.multiply(grad_theta, grad_theta)
                     m_ = m
                     v_ = v
                 else:
                     m = self.beta_1 * m + (1 - self.beta_1) * grad_theta
-                    v = self.beta_2 * v + (1 - self.beta_2) * torch.multiply(grad_theta, grad_theta)
+                    v = self.beta_2 * v + (1 - self.beta_2) * np.multiply(grad_theta, grad_theta)
                     m_ = m / (1 - self.beta_1**iter)
                     v_ = v / (1 - self.beta_2**iter)
 
-                adj_grad = m_.div_(eps + np.sqrt(v_))
-                # adj_grad = np.divide(m_, eps + np.sqrt(v_))
+                adj_grad = np.divide(m_, eps + np.sqrt(v_))
                 self.theta = self.theta + self.svgd_learning_rate * adj_grad
 
-            # '''
-            #     Model selection by using a validation set
-            # '''
-            # X_dev = self.normalization(X_dev)
-            # val = [0 for _ in range(self.M)]
-            # for i in range(self.M):
-            #     w1, b1, w2, b2, loggamma, loglambda = self.unpack_weights(self.theta[i, :])
-            #     pred_y_dev = self.nn_predict(X_dev, w1, b1, w2, b2) * self.std_y_train + self.mean_y_train
-            #     # likelihood
+            '''
+                Model selection by using a validation set
+            '''
+            Phi_eval = self.network.basis_funcs(torch.Tensor(self.X_val), bias=self.bias, linear=self.linear).data.cpu().numpy()
+            lls = np.zeros(self.M)
+            for i in range(self.M):
+                w, loggamma, loglambda = self.unpack_weights(self.theta[i, :])
+                pred_y_val = self.nn_predict(Phi_eval, w)
+                # likelihood
 
-            #     def f_log_lik(loggamma):
-            #         return np.sum(np.log(np.sqrt(np.exp(loggamma)) / np.sqrt(2 * np.pi) * np.exp(-1 * (np.power(pred_y_dev - y_dev, 2) / 2) * np.exp(loggamma))))
-            #     # The higher probability is better
-            #     lik1 = f_log_lik(loggamma)
-            #     # one heuristic setting
-            #     loggamma = -np.log(np.mean(np.power(pred_y_dev - y_dev, 2)))
-            #     lik2 = f_log_lik(loggamma)
-            #     if lik2 > lik1:
-            #         self.theta[i, -2] = loggamma  # update loggamma
+                def f_log_lik(loggamma):
+                    return np.sum(np.log(np.sqrt(np.exp(loggamma)) / np.sqrt(2 * np.pi) * np.exp(-1 * (np.power(pred_y_val - self.y_val, 2) / 2) * np.exp(loggamma))))
+                # The higher probability is better
+                lik1 = f_log_lik(loggamma)
+                # one heuristic setting
+                loggamma = -np.log(np.mean(np.power(pred_y_val - self.y_val, 2)))
+                lik2 = f_log_lik(loggamma)
+                if lik2 > lik1:
+                    self.theta[i, -2] = loggamma  # update loggamma
+                lls[i] = max(lik1, lik2)
+            pbar.set_description(f"Validation LogLikelihood: {lls.max():.2f}")
 
     def svgd_kernel(self, h=-1):
-        sq_dist = torch.pdist(self.theta)
-        pairwise_dists = squareform(self.theta.shape[0], sq_dist)**2
+        sq_dist = scipy.spatial.distance.pdist(self.theta)
+        pairwise_dists = scipy.spatial.distance.squareform(sq_dist)**2
         if h < 0:  # if h < 0, using median trick
-            h = torch.median(pairwise_dists)
+            h = np.median(pairwise_dists)
             h = np.sqrt(0.5 * h / np.log(self.theta.shape[0] + 1))
-        # compute the rbf kernel
-        Kxy = torch.exp(-pairwise_dists / h**2 / 2)
-        dxkxy = -torch.matmul(Kxy, self.theta)
-        sumkxy = torch.sum(Kxy, axis=1)
 
+        # compute the rbf kernel
+        Kxy = np.exp(-pairwise_dists / h**2 / 2)
+
+        dxkxy = -np.matmul(Kxy, self.theta)
+        sumkxy = np.sum(Kxy, axis=1)
         for i in range(self.theta.shape[1]):
-            dxkxy[:, i] = dxkxy[:, i] + torch.multiply(self.theta[:, i], sumkxy)
+            dxkxy[:, i] = dxkxy[:, i] + np.multiply(self.theta[:, i], sumkxy)
         dxkxy = dxkxy / (h**2)
         return (Kxy, dxkxy)
 
     def nn_predict(self, phi, w):
-        """
-        docstring
-        """
         return phi @ w
 
     def pack_weights(self, w, loggamma, loglambda):
         '''
             Pack all parameters in our model
         '''
-        params = torch.cat([w.view(-1), loggamma.view(-1), loglambda.view(-1)], dim=0)
+        params = np.concatenate([w.flatten(), [loggamma], [loglambda]])
         return params
 
     def unpack_weights(self, z):
@@ -391,6 +398,20 @@ class SVGD(BaseModel):
             else:
                 excerpt = slice(start_idx, start_idx + batchsize)
             yield inputs[excerpt], targets[excerpt]
+
+    def predict(self, X_test):
+        X_test, _, _ = zero_mean_unit_var_normalization(X_test, self.X_mean, self.X_std)
+        Phi_test = self.network.basis_funcs(torch.Tensor(X_test), bias=self.bias, linear=self.linear).data.cpu().numpy()
+        predictions = np.zeros([X_test.shape[0], self.M])
+
+        for i in range(self.M):
+            w, _, _ = self.unpack_weights(self.theta[i, :])
+            pred_y = self.nn_predict(Phi_test, w)
+            predictions[:, i] = pred_y.flatten()
+
+        mean = predictions.mean()
+        var = predictions.var()
+        return mean * self.y_std + self.y_mean, var * self.y_std**2
 
 
 def squareform(n: int, dist: torch.Tensor):

@@ -24,11 +24,11 @@ size_train = int(np.round(X_input.shape[0] * train_ratio))
 index_train = permutation[0: size_train]
 index_test = permutation[size_train:]
 
-X_train, y_train = X_input[index_train, :], y_input[index_train]
+X, y = X_input[index_train, :], y_input[index_train]
 X_test, y_test = X_input[index_test, :], y_input[index_test]
 
-model = SVGD(X_train, y_train)
-model.train(X_train, y_train)
+model = SVGD(X, y, rng=np.random.RandomState(12345))
+model.train()
 
 
 x_test_norm = zero_mean_unit_var_normalization(X_test, model.X_mean, model.X_std)[0]
@@ -36,5 +36,3 @@ x_test_norm = zero_mean_unit_var_normalization(X_test, model.X_mean, model.X_std
 # Get basis functions from the network
 basis_funcs = model.network.basis_funcs(torch.Tensor(x_test_norm)).data.numpy()
 m, v = model.predict(X_test)
-print(np.mean(np.log((1. / np.sqrt(2 * np.pi * v)) * np.exp(-1 * (np.power(y_test - m, 2) / (2 * v))))))
-import pdb; pdb.set_trace()
